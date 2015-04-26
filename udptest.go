@@ -218,42 +218,6 @@ func write(conn *net.UDPConn, bytes []byte) (n int, err error) {
 	return
 }
 
-// wraps net.Conn.WriteToUDP() with simple error handling
-// only use with Conns created with ListenUDP()
-func writeto(conn *net.UDPConn, bytes []byte, addr *net.UDPAddr) (n int, err error) {
-	n, err = conn.WriteToUDP(bytes, addr)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "ERROR from WriteToUDP():", err.Error())
-		panic(err)
-	}
-	if n != len(bytes) {
-		estr := fmt.Sprintf("ERROR - only %v bytes written", n)
-		fmt.Fprintln(os.Stderr, estr)
-		panic(estr)
-	}
-	return
-}
-
-// wraps net.UDPConn.Read() with simple error handling
-func read(conn *net.UDPConn, buf []byte) (n int, err error) {
-	n, err = conn.Read(buf)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "ERROR from Read():", err.Error())
-		panic(err)
-	}
-	return
-}
-
-// wraps net.UDPConn.ReadFromUDP() with simple error handling
-func readfrom(conn *net.UDPConn, buf []byte) (n int, raddr *net.UDPAddr, err error) {
-	n, raddr, err = conn.ReadFromUDP(buf)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "ERROR from ReadFromUDP():", err.Error())
-		panic(err)
-	}
-	return
-}
-
 // wraps net.UDPConn.ReadFromUDP() with a timeout
 // returns timeout=true, err=nil if timeout
 func readWithTimeout(conn *net.UDPConn, buf []byte, wait time.Duration) (n int, raddr *net.UDPAddr, timeout bool, err error) {
