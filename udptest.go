@@ -10,36 +10,79 @@ import (
 	"time"
 )
 
-// creates a udp Conn and sends udp data
-func udpClient(target string, clientnum int, done *sync.WaitGroup) {
+// holds a udp message (received or sent)
+type message struct {
+	bytes []byte
+	raddr *net.UDPAddr
+}
+
+////////////////////////////////////////////////////////
+// udpClient
+////////////////////////////////////////////////////////
+
+// reads requests off input channel, uses udpRequest() to process
+// requests that time out are written to timeout channel
+// runs until requests input channel is closed
+// signals done WaitGroup when done
+func udpClient(requests, timeouts chan *message, clientname string, done *sync.WaitGroup) {
+	defer done.Done() // signal when we're done
+
+	const MAX_TRIES int = 3
+	nreqs, ntimeouts := 0, 0
+	retries := map[int]int{} // retries[ntries]=nsuccessful for ntries>1
+
+	// read requests off input channel until closed
+	for request := range requests {
+		nreqs++
+		ok, ntries := udpRequest(request, MAX_TRIES)
+		switch {
+		case !ok: // timeout
+			//fmt.Printf("CLIENT '%s':  Request #%v timed out after %v tries:  '%s'\n", clientname, nreqs, ntries, request.bytes)
+			ntimeouts++
+			timeouts <- request
+		case ntries > 1: // success, with retries
+			//fmt.Printf("CLIENT '%s':  Request #%v required %v tries:  '%s'\n", clientname, nreqs, ntries, request.bytes)
+			retries[ntries] = retries[ntries] + 1 // note that map[nonexist] == zero
+		}
+	}
+
+	// done
+	fmt.Printf("CLIENT '%s':  Successfully sent %v requests (%v), had %v timeouts\n", clientname, nreqs-ntimeouts, retries, ntimeouts)
+}
+
+// creates a udp Conn, sends data, and waits for ack
+// retries a few times until it gets an ack
+func udpRequest(msg *message, maxtries int) (ok bool, ntries int) {
 	// create conn
-	addr, _ := resolve(target)
-	conn, _ := dial(addr)
+	conn, _ := dial(msg.raddr)
 	defer conn.Close()
 
 	// loop, sending until we receive
-	for i := 1; ; i++ {
-		// send bytes
-		bytes := []byte(fmt.Sprintf("hello from #%v", clientnum))
-		write(conn, bytes)
+	for ntries = 1; ntries <= maxtries; ntries++ {
+		// send
+		write(conn, msg.bytes)
 
 		// read bytes (possibly timing out)
 		buf := make([]byte, 2048)
 		_, _, timeout, _ := readwithtimeout(conn, buf, 2*time.Second)
 		if !timeout {
-			//fmt.Printf("CLIENT #%v:  Got %v bytes in reply (try #%v): '%s'\n", clientnum, nbytes, i, buf[:nbytes])
-			break // success
+			return true, ntries // success
 		}
-		fmt.Printf("CLIENT #%v:  Timed out on request #%v; retrying...\n", clientnum, i)
 	}
 
-	// done
-	done.Done() // let people know
+	// failure
+	return false, ntries
 }
+
+////////////////////////////////////////////////////
+// udpServer
+////////////////////////////////////////////////////
 
 // responds to UDP messages
 // runs until quit is signaled, then signals done
 func udpServer(target string, quit chan int, done chan int) {
+	defer func() { done <- 0 }() // signal when we're done
+
 	// create conn
 	addr, _ := resolve(target)
 	conn, _ := listen(addr)
@@ -66,17 +109,10 @@ loop:
 		}
 	}
 
-	// done
+	// clean up
 	myquit <- 0       // signal reader to stop
 	for range count { // wait for handler to stop
 	}
-	done <- 0 // signal we're done
-}
-
-// holds a udp message (received or sent)
-type message struct {
-	bytes []byte
-	raddr *net.UDPAddr
 }
 
 // reads UDP messages and pushes them to a channel
@@ -125,8 +161,8 @@ func udpHandler(conn *net.UDPConn, msgs chan *message) (count chan int, errs cha
 		defer close(errs)
 		i := 0
 		for msg := range msgs { // read channel until closed
-			if rand.Intn(50) == 0 {
-				continue // drop 2% of packets
+			if rand.Intn(10) == 0 {
+				continue // drop 10% of packets
 			}
 			//send reply
 			bytes := []byte(fmt.Sprintf("world! (%v)", i))
@@ -147,30 +183,77 @@ func udpHandler(conn *net.UDPConn, msgs chan *message) (count chan int, errs cha
 	return
 }
 
+/////////////////////////////////////////////////////////
+// main
+/////////////////////////////////////////////////////////
+
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	rand.Seed(time.Now().UnixNano())
 
 	const target string = "localhost:1234"
-	const num int = 10000
+	const numrequests int = 10 * 1000
+	const numclients int = 100
 
 	// start server
-	srvquit, srvdone := make(chan int), make(chan int)
-	go udpServer(target, srvquit, srvdone)
+	quit, done := make(chan int), make(chan int)
+	go udpServer(target, quit, done)
+
+	// start request source & timeout sink
+	requests := startRequestGenerator(target, numrequests)
+	timeouts := startTimeoutSink(done)
 
 	// start clients
 	var clients sync.WaitGroup
-	for i := 0; i < num; i++ {
+	for i := 0; i < numclients; i++ {
 		clients.Add(1)
-		go udpClient(target, i, &clients)
-		time.Sleep(time.Microsecond) // allow server to run
+		go udpClient(requests, timeouts, fmt.Sprintf("%v", i), &clients)
 	}
 
-	// quit
-	clients.Wait() // wait for clients
-	srvquit <- 0   // signal server to stop
-	<-srvdone      // wait for everyone
+	// clean up
+	clients.Wait()  // wait for clients (which wait for requests channel to close)
+	close(quit)     // signal server to stop
+	close(timeouts) // signal timeoutSink to stop
+	<-done          // wait for server & timeoutSink (twice)
+	<-done
 }
+
+// starts a goroutine to generate request messages
+// stand-in for queue reader
+// closes request msg channel when done
+func startRequestGenerator(target string, numrequests int) (requests chan *message) {
+	requests = make(chan *message, 100)
+	raddr, _ := resolve(target)
+
+	generator := func() {
+		defer close(requests)
+		for i := 0; i < numrequests; i++ {
+			bytes := []byte(fmt.Sprintf("Hello (%v)", i))
+			requests <- &message{bytes, raddr}
+		}
+	}
+	go generator()
+	return
+}
+
+// starts a goroutine to handle timed out requests
+// returns the channel upon which they should be pushed
+func startTimeoutSink(done chan int) (input chan *message) {
+	input = make(chan *message, 10)
+
+	sink := func() {
+		defer func() { done <- 0 }() // signal when done
+		for msg := range input {
+			fmt.Printf("SINK:  Got timed out request:  %s\n", msg.bytes)
+		}
+	}
+	go sink()
+	return
+}
+
+/////////////////////////////////////////////////////
+// helper functions
+/////////////////////////////////////////////////////
 
 // wraps net.ResolveUDPAddr() with simple error handling
 func resolve(target string) (addr *net.UDPAddr, err error) {
