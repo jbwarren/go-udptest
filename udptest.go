@@ -6,7 +6,7 @@ import (
 	"net"
 	"os"
 	"runtime"
-	"sync"
+	//"sync"
 	"time"
 )
 
@@ -20,34 +20,48 @@ type message struct {
 // udpClient
 ////////////////////////////////////////////////////////
 
+const MAX_TRIES int = 3
+
+// holds stats for client performance
+// trystats[ntries] = num messages successful
+// trystats[0] = num messages unsuccessful (timed out)
+type trystats [MAX_TRIES + 1]int
+
+// adds stats to a stats object
+func (s1 *trystats) Add(s2 *trystats) {
+	for i, val := range s2 {
+		s1[i] += val
+	}
+}
+
+// totals all entries
+func (s *trystats) Total() (total int) {
+	for _, val := range s {
+		total += val
+	}
+	return
+}
+
 // reads requests off input channel, uses udpRequest() to process
 // requests that time out are written to timeout channel
 // runs until requests input channel is closed
-// signals done WaitGroup when done
-func udpClient(requests, timeouts chan *message, clientname string, done *sync.WaitGroup) {
-	defer done.Done() // signal when we're done
-
-	const MAX_TRIES int = 3
-	nreqs, ntimeouts := 0, 0
-	retries := map[int]int{} // retries[ntries]=nsuccessful for ntries>1
+// sends stats when done
+func udpClient(requests, timeouts chan *message, clientname string, stats chan *trystats) {
+	// keep track of stats
+	mystats := trystats{}
+	defer func() { stats <- &mystats }() // push our stats when done
 
 	// read requests off input channel until closed
 	for request := range requests {
-		nreqs++
 		ok, ntries := udpRequest(request, MAX_TRIES)
 		switch {
 		case !ok: // timeout
-			//fmt.Printf("CLIENT '%s':  Request #%v timed out after %v tries:  '%s'\n", clientname, nreqs, ntries, request.bytes)
-			ntimeouts++
 			timeouts <- request
-		case ntries > 1: // success, with retries
-			//fmt.Printf("CLIENT '%s':  Request #%v required %v tries:  '%s'\n", clientname, nreqs, ntries, request.bytes)
-			retries[ntries] = retries[ntries] + 1 // note that map[nonexist] == zero
+			mystats[0] += 1 // note that map[nonexist] == zero
+		default: // success
+			mystats[ntries] += 1 // note that map[nonexist] == zero
 		}
 	}
-
-	// done
-	fmt.Printf("CLIENT '%s':  Successfully sent %v requests (%v), had %v timeouts\n", clientname, nreqs-ntimeouts, retries, ntimeouts)
 }
 
 // creates a udp Conn, sends data, and waits for ack
@@ -162,7 +176,7 @@ func udpHandler(conn *net.UDPConn, msgs chan *message) (count chan int, errs cha
 		i := 0
 		for msg := range msgs { // read channel until closed
 			if rand.Intn(10) == 0 {
-				continue // drop 10% of packets
+				continue // drop 1/10 packets
 			}
 			//send reply
 			bytes := []byte(fmt.Sprintf("world! (%v)", i))
@@ -204,14 +218,19 @@ func main() {
 	timeouts := startTimeoutSink(done)
 
 	// start clients
-	var clients sync.WaitGroup
+	stats := make(chan *trystats)
 	for i := 0; i < numclients; i++ {
-		clients.Add(1)
-		go udpClient(requests, timeouts, fmt.Sprintf("%v", i), &clients)
+		go udpClient(requests, timeouts, fmt.Sprintf("%v", i), stats)
 	}
 
+	// consume stats (& wait for all clients to exit)
+	allstats := trystats{}
+	for i := 0; i < numclients; i++ {
+		allstats.Add(<-stats)
+	}
+	printStats(&allstats)
+
 	// clean up
-	clients.Wait()  // wait for clients (which wait for requests channel to close)
 	close(quit)     // signal server to stop
 	close(timeouts) // signal timeoutSink to stop
 	<-done          // wait for server & timeoutSink (twice)
@@ -251,8 +270,18 @@ func startTimeoutSink(done chan int) (input chan *message) {
 	return
 }
 
+// prints client trystats
+func printStats(stats *trystats) {
+	fmt.Println("\nTotal number of requests attempted: ", stats.Total())
+	fmt.Println("  timed out:            ", stats[0])
+	fmt.Println("  successful (1st try): ", stats[1])
+	for i := 2; i <= MAX_TRIES; i++ {
+		fmt.Printf("             (%v tries):  %v\n", i, stats[i])
+	}
+}
+
 /////////////////////////////////////////////////////
-// helper functions
+// UDP helper functions
 /////////////////////////////////////////////////////
 
 // wraps net.ResolveUDPAddr() with simple error handling
